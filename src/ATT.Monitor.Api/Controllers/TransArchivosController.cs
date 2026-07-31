@@ -15,7 +15,10 @@ public sealed class TransArchivosController(
     ITransArchivoData transArchivo,
     IMonitorFilePaths filePaths) : ControllerBase
 {
-    private static readonly Regex InvalidFileCharsRegex = new(@"[^a-zA-Z0-9_-]", RegexOptions.Compiled);
+    private static readonly Regex InvalidFileCharsRegex = new(
+        @"[^a-zA-Z0-9_-]",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant,
+        TimeSpan.FromSeconds(1));
 
     private const string MsgSinArchivo = "No se ha enviado ningún archivo.";
     private const string MsgSoloZip = "Solo se permiten archivos .zip";

@@ -22,6 +22,7 @@ public sealed class ReporteGeneracionService(
     public const int MaxRangoDiasInclusive = 365;
     public const int MaxFilasExport = 5000;
     private const int PageSize = 500;
+    private static readonly TimeSpan RegexTimeout = TimeSpan.FromSeconds(1);
 
     private sealed record ReporteDef(
         string StoredProcedure,
@@ -352,7 +353,12 @@ public sealed class ReporteGeneracionService(
     {
         if (string.IsNullOrWhiteSpace(raw))
             return string.Empty;
-        var digits = Regex.Replace(raw, @"\D", string.Empty);
+        var digits = Regex.Replace(
+            raw,
+            @"\D",
+            string.Empty,
+            RegexOptions.CultureInvariant,
+            RegexTimeout);
         if (digits.Length < 4)
             return "****";
         return $"****{digits[^4..]}";
