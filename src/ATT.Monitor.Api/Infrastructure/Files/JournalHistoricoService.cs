@@ -14,6 +14,15 @@ public sealed class JournalHistoricoService(
 {
     private static readonly string[] MergeableExtensions = [".txt", ".log", ".journal", ".csv", ".json"];
 
+    private const int MaxEpLength = 80;
+
+    private static readonly char[] AdditionalInvalidPathChars =
+    [
+        Path.DirectorySeparatorChar,
+        Path.AltDirectorySeparatorChar,
+        ':'
+    ];
+
     public Task<JournalHistoricoListResponse> ListarAsync(JournalHistoricoListRequest request, CancellationToken cancellationToken = default)
     {
         _ = cancellationToken;
@@ -68,19 +77,75 @@ public sealed class JournalHistoricoService(
 
     private static List<string> ResolveEpsForList(JournalHistoricoListRequest request)
     {
+        ArgumentNullException.ThrowIfNull(request);
+
         if (request.Eps is { Count: > 0 })
         {
-            return request.Eps
-                .Select(e => (e ?? string.Empty).Trim())
-                .Where(e => e.Length > 0)
+            var eps = request.Eps
+                .Select(NormalizeAndValidateEp)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
+
+            if (eps.Count == 0)
+                throw new ArgumentException("Indique al menos una estación válida.", nameof(request));
+
+            return eps;
         }
 
-        var one = (request.Ep ?? string.Empty).Trim();
-        if (string.IsNullOrWhiteSpace(one))
+        if (string.IsNullOrWhiteSpace(request.Ep))
             throw new ArgumentException("Indique al menos una estación (eps o ep).", nameof(request));
-        return [one];
+
+        return [NormalizeAndValidateEp(request.Ep)];
+    }
+
+    private static string NormalizeAndValidateEp(string? value)
+    {
+        var ep = (value ?? string.Empty).Trim();
+
+        if (string.IsNullOrWhiteSpace(ep))
+            throw new ArgumentException("El identificador de estación no puede estar vacío.");
+
+        if (ep.Length > MaxEpLength)
+            throw new ArgumentException($"El identificador de estación no puede superar {MaxEpLength} caracteres.");
+
+        if (ep is "." or ".." || ep.Contains("..", StringComparison.Ordinal))
+            throw new ArgumentException("El identificador de estación contiene una secuencia no permitida.");
+
+        if (Path.IsPathRooted(ep) ||
+            ep.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 ||
+            ep.IndexOfAny(AdditionalInvalidPathChars) >= 0)
+        {
+            throw new ArgumentException("El identificador de estación contiene caracteres no permitidos.");
+        }
+
+        return ep;
+    }
+
+    private static bool IsSafeRelativePath(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value) || Path.IsPathRooted(value))
+            return false;
+
+        var segments = value
+            .Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar)
+            .Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries);
+
+        return segments.Length > 0 &&
+               segments.All(segment =>
+                   segment is not "." and not ".." &&
+                   segment.IndexOfAny(Path.GetInvalidFileNameChars()) < 0);
+    }
+
+    private static string? FindChildDirectory(string parentDirectory, string expectedName)
+    {
+        if (!Directory.Exists(parentDirectory))
+            return null;
+
+        return Directory.EnumerateDirectories(parentDirectory)
+            .FirstOrDefault(path => string.Equals(
+                Path.GetFileName(path),
+                expectedName,
+                StringComparison.OrdinalIgnoreCase));
     }
 
     private static void CollectNewLayout(
@@ -91,30 +156,45 @@ public sealed class JournalHistoricoService(
         List<JournalHistoricoItemDto> list,
         int maxItems)
     {
-        var epDir = Path.Combine(rootFull, ep);
-        if (!Directory.Exists(epDir))
+        var safeEp = NormalizeAndValidateEp(ep);
+
+        var epDir = FindChildDirectory(rootFull, safeEp);
+        if (epDir is null)
             return;
 
         foreach (var loteDir in Directory.EnumerateDirectories(epDir))
         {
             if (list.Count >= maxItems)
                 return;
+
             var loteId = Path.GetFileName(loteDir);
+            if (string.IsNullOrWhiteSpace(loteId))
+                continue;
+
+            var loteFullPath = Path.GetFullPath(loteDir)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                + Path.DirectorySeparatorChar;
+
             foreach (var file in Directory.EnumerateFiles(loteDir, "*", SearchOption.AllDirectories))
             {
                 if (list.Count >= maxItems)
                     return;
-                var fi = new FileInfo(file);
+
+                var fileFullPath = Path.GetFullPath(file);
+                if (!fileFullPath.StartsWith(loteFullPath, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var fi = new FileInfo(fileFullPath);
                 var t = fi.LastWriteTimeUtc;
                 if (t < desdeUtc || t > hastaUtc)
                     continue;
 
-                var rel = Path.GetRelativePath(loteDir, file).Replace(Path.DirectorySeparatorChar, '/');
-                var id = "n:" + ToBase64Url($"{ep}|{loteId}|{rel}");
+                var rel = Path.GetRelativePath(loteDir, fileFullPath).Replace(Path.DirectorySeparatorChar, '/');
+                var id = "n:" + ToBase64Url($"{safeEp}|{loteId}|{rel}");
                 list.Add(new JournalHistoricoItemDto
                 {
                     Id = id,
-                    Ep = ep,
+                    Ep = safeEp,
                     LoteId = loteId,
                     NombreArchivo = fi.Name,
                     RutaRelativa = string.IsNullOrEmpty(rel) ? fi.Name : rel,
@@ -502,22 +582,58 @@ public sealed class JournalHistoricoService(
             var parts = payload.Split('|', 3);
             if (parts.Length != 3)
                 return false;
-            ep = parts[0];
-            var lote = parts[1];
-            var rel = parts[2].Replace('/', Path.DirectorySeparatorChar);
+            try
+            {
+                ep = NormalizeAndValidateEp(parts[0]);
+            }
+            catch (ArgumentException)
+            {
+                return false;
+            }
+
+            var lote = parts[1].Trim();
+            var rel = parts[2].Replace('/', Path.DirectorySeparatorChar).Trim();
+
+            if (string.IsNullOrWhiteSpace(lote) ||
+                lote is "." or ".." ||
+                lote.Contains("..", StringComparison.Ordinal) ||
+                lote.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 ||
+                Path.IsPathRooted(lote))
+            {
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(rel) || Path.IsPathRooted(rel))
+                return false;
+
+            if (!IsSafeRelativePath(rel))
+                return false;
+
             if (allowedEps is not null && !allowedEps.Contains(ep))
                 return false;
-            var combined = Path.GetFullPath(Path.Combine(rootFull.TrimEnd(Path.DirectorySeparatorChar), ep, lote, rel));
-            var rootTrim = rootFull.TrimEnd(Path.DirectorySeparatorChar);
-            var baseEp = Path.GetFullPath(Path.Combine(rootTrim, ep));
-            if (!baseEp.EndsWith(Path.DirectorySeparatorChar))
-                baseEp += Path.DirectorySeparatorChar;
-            if (!combined.StartsWith(baseEp, StringComparison.OrdinalIgnoreCase))
+
+            var epDirectory = FindChildDirectory(rootFull, ep);
+            if (epDirectory is null)
                 return false;
-            if (!File.Exists(combined))
+
+            var loteDirectory = FindChildDirectory(epDirectory, lote);
+            if (loteDirectory is null)
                 return false;
-            fullPath = combined;
-            displayName = string.IsNullOrEmpty(rel) ? Path.GetFileName(combined) : rel.Replace(Path.DirectorySeparatorChar, '/');
+
+            var normalizedRelative = rel
+                .Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
+
+            var matchedFile = Directory.EnumerateFiles(loteDirectory, "*", SearchOption.AllDirectories)
+                .FirstOrDefault(path => string.Equals(
+                    Path.GetRelativePath(loteDirectory, path),
+                    normalizedRelative,
+                    StringComparison.OrdinalIgnoreCase));
+
+            if (matchedFile is null)
+                return false;
+
+            fullPath = matchedFile;
+            displayName = normalizedRelative.Replace(Path.DirectorySeparatorChar, '/');
             return true;
         }
 
@@ -526,6 +642,14 @@ public sealed class JournalHistoricoService(
             var name = FromBase64Url(id[2..]);
             if (string.IsNullOrEmpty(name) || name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
                 return false;
+
+            if (!string.Equals(Path.GetFileName(name), name, StringComparison.Ordinal) ||
+                Path.IsPathRooted(name) ||
+                name.Contains("..", StringComparison.Ordinal))
+            {
+                return false;
+            }
+
             var epPrefix = ExtractEpLegacyPrefix(name);
             if (epPrefix is null)
                 return false;
@@ -534,16 +658,16 @@ public sealed class JournalHistoricoService(
                 return false;
             if (!name.StartsWith(epPrefix + "_", StringComparison.OrdinalIgnoreCase))
                 return false;
-            var combined = Path.GetFullPath(Path.Combine(rootFull.TrimEnd(Path.DirectorySeparatorChar), name));
-            var rootTrim = rootFull.TrimEnd(Path.DirectorySeparatorChar);
-            if (!combined.StartsWith(rootTrim + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) &&
-                !string.Equals(combined, rootTrim, StringComparison.OrdinalIgnoreCase))
+            var matchedFile = Directory.EnumerateFiles(rootFull)
+                .FirstOrDefault(path => string.Equals(
+                    Path.GetFileName(path),
+                    name,
+                    StringComparison.OrdinalIgnoreCase));
+
+            if (matchedFile is null)
                 return false;
-            if (Directory.Exists(combined))
-                return false;
-            if (!File.Exists(combined))
-                return false;
-            fullPath = combined;
+
+            fullPath = matchedFile;
             displayName = name;
             return true;
         }
