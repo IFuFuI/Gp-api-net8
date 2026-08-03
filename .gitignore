@@ -7,7 +7,7 @@
 *.suo
 *.cache
 .vs/
-
+.sonarqube/
 # NuGet
 *.nupkg
 **/packages/

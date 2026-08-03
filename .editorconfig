@@ -1,0 +1,4 @@
+# Los DTOs reflejan nombres de columnas de SQL Server y el contrato JSON
+# con el monitor. CA1707 no aplica: renombrarlos rompería el mapeo.
+[src/ATT.Monitor.Api/Models/**/*.cs]
+dotnet_diagnostic.CA1707.severity = none
