@@ -47,32 +47,43 @@ public sealed class CampanaController(ICampanaData campanaData, ICampanaDocument
         foreach (var epRaw in request.EP.Distinct(StringComparer.OrdinalIgnoreCase))
         {
             var ep = (epRaw ?? string.Empty).Trim();
-            if (string.IsNullOrEmpty(ep))
-                continue;
-
-            if (await campanaData.EpExistsInCampanaAsync(request.ID_CAMPANA, ep, HttpContext.RequestAborted).ConfigureAwait(false))
-            {
-                respuesta.OmitidosDuplicado.Add(ep);
-                continue;
-            }
-
-            var insertado = await campanaData.InsertCampanaEpAsync(request.ID_CAMPANA, ep, HttpContext.RequestAborted).ConfigureAwait(false);
-            if (insertado)
-                respuesta.Agregados.Add(ep);
-            else
-                respuesta.Fallidos.Add(ep);
+            if (ep.Length > 0)
+                await AgregarEpAsync(request.ID_CAMPANA, ep, respuesta).ConfigureAwait(false);
         }
 
-        if (respuesta.Fallidos.Count > 0 && respuesta.Agregados.Count == 0 && respuesta.OmitidosDuplicado.Count == 0)
-            respuesta.Mensaje = "No se pudo agregar ninguna estación de pago.";
-        else if (respuesta.Fallidos.Count > 0)
-            respuesta.Mensaje = "Algunas estaciones no se pudieron agregar; revise los detalles.";
-        else if (respuesta.Agregados.Count == 0 && respuesta.OmitidosDuplicado.Count > 0)
-            respuesta.Mensaje = "Todas las estaciones seleccionadas ya estaban en la campaña.";
-        else
-            respuesta.Mensaje = "Proceso completado.";
-
+        respuesta.Mensaje = ResolverMensajeAgregado(respuesta);
         return Ok(respuesta);
+    }
+
+    /// <summary>Clasifica la EP en agregados, duplicados o fallidos segun el resultado de la insercion.</summary>
+    private async Task AgregarEpAsync(int idCampana, string ep, AgregarEpsCampanaResponse respuesta)
+    {
+        if (await campanaData.EpExistsInCampanaAsync(idCampana, ep, HttpContext.RequestAborted).ConfigureAwait(false))
+        {
+            respuesta.OmitidosDuplicado.Add(ep);
+            return;
+        }
+
+        var insertado = await campanaData.InsertCampanaEpAsync(idCampana, ep, HttpContext.RequestAborted).ConfigureAwait(false);
+        if (insertado)
+            respuesta.Agregados.Add(ep);
+        else
+            respuesta.Fallidos.Add(ep);
+    }
+
+    private static string ResolverMensajeAgregado(AgregarEpsCampanaResponse respuesta)
+    {
+        if (respuesta.Fallidos.Count > 0)
+        {
+            return respuesta.Agregados.Count == 0 && respuesta.OmitidosDuplicado.Count == 0
+                ? "No se pudo agregar ninguna estación de pago."
+                : "Algunas estaciones no se pudieron agregar; revise los detalles.";
+        }
+
+        if (respuesta.Agregados.Count == 0 && respuesta.OmitidosDuplicado.Count > 0)
+            return "Todas las estaciones seleccionadas ya estaban en la campaña.";
+
+        return "Proceso completado.";
     }
 
     [HttpPost("ELIMINAR_EP_CAMPANA")]

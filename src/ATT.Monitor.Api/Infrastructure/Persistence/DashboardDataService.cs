@@ -1032,31 +1032,7 @@ public sealed class DashboardDataService(
         if (request.FechaFin.Date < request.FechaInicio.Date)
             return Array.Empty<Dictionary<string, string>>();
 
-        var cantidad = Math.Clamp(request.CantidadFila, 1, 500);
-        var ignorar = Math.Max(0, request.Ignorar);
-        var filtro = request.Filtro ?? string.Empty;
-        var orden = string.IsNullOrWhiteSpace(request.Orden) ? "FECHA" : request.Orden.Trim();
-        var dir = string.IsNullOrWhiteSpace(request.Dir) ? "ASC" : request.Dir.Trim();
-
-        var parameters = new DynamicParameters();
-        parameters.Add("FechaInicio", request.FechaInicio.Date);
-        parameters.Add("FechaFin", request.FechaFin.Date);
-        parameters.Add("Ignorar", ignorar);
-        parameters.Add("Cantidad_Fila", cantidad);
-        parameters.Add("Filtro", filtro);
-        parameters.Add("Orden", orden);
-        parameters.Add("Dir", dir);
-
-        if (sp.Contains("TRANSACCIONES_BITACORA", StringComparison.OrdinalIgnoreCase))
-        {
-            parameters.Add("SoloError", request.SoloError == true ? 1 : 0);
-            parameters.Add("EP", string.IsNullOrWhiteSpace(request.Ep) ? null : request.Ep.Trim());
-        }
-        else if (sp.Contains("TRANSACCIONES_POR_EQUIPO", StringComparison.OrdinalIgnoreCase))
-        {
-            parameters.Add("EpsCsv", string.IsNullOrWhiteSpace(request.EpsCsv) ? null : request.EpsCsv.Trim());
-            parameters.Add("EP", string.IsNullOrWhiteSpace(request.Ep) ? null : request.Ep.Trim());
-        }
+        var parameters = ConstruirParametrosExport(request, sp);
 
         await using var connection = CreateConnection();
         await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
@@ -1068,6 +1044,40 @@ public sealed class DashboardDataService(
                 commandType: CommandType.StoredProcedure,
                 cancellationToken: cancellationToken)).ConfigureAwait(false);
 
+        return AplanarFilas(rows);
+    }
+
+    /// <summary>Parametros comunes del reporte, mas los especificos del SP invocado.</summary>
+    private static DynamicParameters ConstruirParametrosExport(ReporteExportRequest request, string sp)
+    {
+        var parameters = new DynamicParameters();
+        parameters.Add("FechaInicio", request.FechaInicio.Date);
+        parameters.Add("FechaFin", request.FechaFin.Date);
+        parameters.Add("Ignorar", Math.Max(0, request.Ignorar));
+        parameters.Add("Cantidad_Fila", Math.Clamp(request.CantidadFila, 1, 500));
+        parameters.Add("Filtro", request.Filtro ?? string.Empty);
+        parameters.Add("Orden", string.IsNullOrWhiteSpace(request.Orden) ? "FECHA" : request.Orden.Trim());
+        parameters.Add("Dir", string.IsNullOrWhiteSpace(request.Dir) ? "ASC" : request.Dir.Trim());
+
+        var ep = string.IsNullOrWhiteSpace(request.Ep) ? null : request.Ep.Trim();
+
+        if (sp.Contains("TRANSACCIONES_BITACORA", StringComparison.OrdinalIgnoreCase))
+        {
+            parameters.Add("SoloError", request.SoloError == true ? 1 : 0);
+            parameters.Add("EP", ep);
+        }
+        else if (sp.Contains("TRANSACCIONES_POR_EQUIPO", StringComparison.OrdinalIgnoreCase))
+        {
+            parameters.Add("EpsCsv", string.IsNullOrWhiteSpace(request.EpsCsv) ? null : request.EpsCsv.Trim());
+            parameters.Add("EP", ep);
+        }
+
+        return parameters;
+    }
+
+    /// <summary>Convierte las filas dinamicas de Dapper en diccionarios de texto.</summary>
+    private static List<Dictionary<string, string>> AplanarFilas(IEnumerable<dynamic> rows)
+    {
         var list = new List<Dictionary<string, string>>();
         foreach (var row in rows)
         {

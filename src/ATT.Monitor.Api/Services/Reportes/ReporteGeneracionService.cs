@@ -204,50 +204,73 @@ public sealed class ReporteGeneracionService(
         var all = new List<Dictionary<string, string>>();
         var ignorar = 0;
         int? knownTotal = null;
+
         while (all.Count < MaxFilasExport)
         {
             var batch = await dashboard.GetReporteExportPaginadoAsync(
-                new ReporteExportRequest
-                {
-                    StoredProcedure = def.StoredProcedure,
-                    FechaInicio = request.FechaInicio.Date,
-                    FechaFin = request.FechaFin.Date,
-                    Ignorar = ignorar,
-                    CantidadFila = PageSize,
-                    SoloError = def.SoloError,
-                    Ep = epsCsv == null ? legacyEp : null,
-                    EpsCsv = epsCsv,
-                    Orden = def.Orden,
-                    Dir = "ASC"
-                },
+                ConstruirPeticionPagina(request, def, epsCsv, legacyEp, ignorar),
                 cancellationToken).ConfigureAwait(false);
 
             if (batch.Count == 0)
                 break;
 
-            if (knownTotal == null && batch[0].TryGetValue("Total", out var t) &&
-                int.TryParse(t, NumberStyles.Integer, CultureInfo.InvariantCulture, out var tot))
-                knownTotal = tot;
-
-            foreach (var row in batch)
-            {
-                if (all.Count >= MaxFilasExport)
-                    break;
-
-                var copy = new Dictionary<string, string>(row, StringComparer.OrdinalIgnoreCase);
-                copy.Remove("Total");
-                MaskTarjetaInRow(copy);
-                all.Add(copy);
-            }
+            knownTotal ??= LeerTotal(batch[0]);
+            AgregarFilas(batch, all);
 
             ignorar += batch.Count;
+
             if (batch.Count < PageSize)
                 break;
+
             if (knownTotal is > 0 && ignorar >= knownTotal.Value)
                 break;
         }
 
         return (all, all.Count);
+    }
+
+    private static ReporteExportRequest ConstruirPeticionPagina(
+        GenerarReporteRequest request,
+        ReporteDef def,
+        string? epsCsv,
+        string? legacyEp,
+        int ignorar) =>
+        new()
+        {
+            StoredProcedure = def.StoredProcedure,
+            FechaInicio = request.FechaInicio.Date,
+            FechaFin = request.FechaFin.Date,
+            Ignorar = ignorar,
+            CantidadFila = PageSize,
+            SoloError = def.SoloError,
+            Ep = epsCsv == null ? legacyEp : null,
+            EpsCsv = epsCsv,
+            Orden = def.Orden,
+            Dir = "ASC"
+        };
+
+    /// <summary>El SP devuelve el total en cada fila; se lee una sola vez de la primera.</summary>
+    private static int? LeerTotal(IReadOnlyDictionary<string, string> primeraFila) =>
+        primeraFila.TryGetValue("Total", out var t) &&
+        int.TryParse(t, NumberStyles.Integer, CultureInfo.InvariantCulture, out var total)
+            ? total
+            : null;
+
+    /// <summary>Copia las filas del lote enmascarando tarjetas, hasta el tope de exportacion.</summary>
+    private static void AgregarFilas(
+        IReadOnlyList<Dictionary<string, string>> batch,
+        List<Dictionary<string, string>> destino)
+    {
+        foreach (var row in batch)
+        {
+            if (destino.Count >= MaxFilasExport)
+                return;
+
+            var copy = new Dictionary<string, string>(row, StringComparer.OrdinalIgnoreCase);
+            copy.Remove("Total");
+            MaskTarjetaInRow(copy);
+            destino.Add(copy);
+        }
     }
 
     private static void PrepareExportRows(
