@@ -288,9 +288,34 @@ public sealed class JournalHistoricoService(
         if (!rootFull.EndsWith(Path.DirectorySeparatorChar))
             rootFull += Path.DirectorySeparatorChar;
 
-        var allowed = NormalizeAllowedEps(request.AllowedEps);
+        var resolved = ResolverIds(ids, rootFull, NormalizeAllowedEps(request.AllowedEps), cancellationToken);
 
-        var resolved = new List<ResolvedJournalFile>();
+        var distinctEps = resolved.Select(r => r.Ep).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        var multiEpLayout = distinctEps.Count > 1;
+
+        var zipFileName = ConstruirNombreZip(distinctEps);
+
+        await EscribirZipAsync(request, zipPath, opt, resolved, multiEpLayout, cancellationToken).ConfigureAwait(false);
+
+        var summary = new JournalHistoricoDownloadSummaryDto
+        {
+            NombreZip = zipFileName,
+            Ep = multiEpLayout ? ConstruirEtiquetaEps(distinctEps) : distinctEps[0],
+            ArchivosIncluidos = ListarArchivos(resolved, multiEpLayout),
+            Modo = ResolverModo(request.Unificar, multiEpLayout),
+            Partes = ContarPartes(request.Unificar, multiEpLayout, zipPath, resolved.Count)
+        };
+
+        return (zipFileName, summary);
+    }
+
+    private static List<ResolvedJournalFile> ResolverIds(
+        List<string> ids,
+        string rootFull,
+        HashSet<string>? allowed,
+        CancellationToken cancellationToken)
+    {
+        var resolved = new List<ResolvedJournalFile>(ids.Count);
         foreach (var id in ids)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -299,76 +324,72 @@ public sealed class JournalHistoricoService(
             resolved.Add(new ResolvedJournalFile(ep, full, display));
         }
 
-        var distinctEps = resolved.Select(r => r.Ep).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-        var multiEpLayout = distinctEps.Count > 1;
+        return resolved;
+    }
 
+    private static string ConstruirNombreZip(List<string> distinctEps)
+    {
         var stamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture);
-        string zipBaseName;
-        if (distinctEps.Count == 1)
-            zipBaseName = $"journal_{SanitizeZipSegment(distinctEps[0])}_{stamp}";
-        else
-            zipBaseName = $"journal_export_{stamp}";
+        return distinctEps.Count == 1
+            ? $"journal_{SanitizeZipSegment(distinctEps[0])}_{stamp}.zip"
+            : $"journal_export_{stamp}.zip";
+    }
 
-        var zipFileName = zipBaseName + ".zip";
-
-        if (request.Unificar)
+    /// <summary>Escribe el zip segun unificacion y cantidad de EPs. Unificar exige que todo sea texto.</summary>
+    private static async Task EscribirZipAsync(
+        JournalHistoricoDownloadRequest request,
+        string zipPath,
+        JournalHistoricoOptions opt,
+        List<ResolvedJournalFile> resolved,
+        bool multiEpLayout,
+        CancellationToken cancellationToken)
+    {
+        if (!request.Unificar)
         {
-            foreach (var r in resolved)
-            {
-                if (!IsMergeable(r.FullPath))
-                {
-                    throw new InvalidOperationException(
-                        "Unificar solo aplica a archivos de texto (.txt, .log, .journal, .csv, .json). Quite archivos binarios o desactive unificar.");
-                }
-            }
-
-            if (!multiEpLayout)
-                await WriteUnifiedZipSingleEpAsync(zipPath, resolved, opt, cancellationToken).ConfigureAwait(false);
+            if (multiEpLayout)
+                await WriteMultiZipEpFoldersAsync(zipPath, resolved, cancellationToken).ConfigureAwait(false);
             else
-                await WriteUnifiedZipPerEpFoldersAsync(zipPath, resolved, opt, cancellationToken).ConfigureAwait(false);
+                await WriteMultiZipFlatAsync(zipPath, resolved, cancellationToken).ConfigureAwait(false);
+            return;
         }
-        else if (multiEpLayout)
+
+        if (resolved.Exists(r => !IsMergeable(r.FullPath)))
         {
-            await WriteMultiZipEpFoldersAsync(zipPath, resolved, cancellationToken).ConfigureAwait(false);
+            throw new InvalidOperationException(
+                "Unificar solo aplica a archivos de texto (.txt, .log, .journal, .csv, .json). Quite archivos binarios o desactive unificar.");
         }
+
+        if (multiEpLayout)
+            await WriteUnifiedZipPerEpFoldersAsync(zipPath, resolved, opt, cancellationToken).ConfigureAwait(false);
         else
-        {
-            await WriteMultiZipFlatAsync(zipPath, resolved, cancellationToken).ConfigureAwait(false);
-        }
+            await WriteUnifiedZipSingleEpAsync(zipPath, resolved, opt, cancellationToken).ConfigureAwait(false);
+    }
 
-        var modo = request.Unificar
-            ? (multiEpLayout ? "unificado_por_ep" : "unificado")
-            : (multiEpLayout ? "zip_con_carpetas" : "zip");
+    private static string ResolverModo(bool unificar, bool multiEpLayout)
+    {
+        if (unificar)
+            return multiEpLayout ? "unificado_por_ep" : "unificado";
 
-        var epsLabel = distinctEps.Count <= 5
+        return multiEpLayout ? "zip_con_carpetas" : "zip";
+    }
+
+    private static string ConstruirEtiquetaEps(List<string> distinctEps) =>
+        distinctEps.Count <= 5
             ? string.Join(", ", distinctEps.OrderBy(e => e, StringComparer.OrdinalIgnoreCase))
             : string.Join(", ", distinctEps.Take(3)) + "…";
 
-        var partes = request.Unificar && !multiEpLayout
-            ? CountUnifiedTxtParts(zipPath)
-            : request.Unificar
-                ? CountZipEntries(zipPath)
-                : resolved.Count;
+    private static int ContarPartes(bool unificar, bool multiEpLayout, string zipPath, int totalArchivos)
+    {
+        if (!unificar)
+            return totalArchivos;
 
-        List<string> archivosLista;
-        if (request.Unificar && !multiEpLayout)
-            archivosLista = resolved.Select(r => r.DisplayName).ToList();
-        else if (multiEpLayout)
-            archivosLista = resolved.Select(r => $"{r.Ep}/{r.DisplayName}").ToList();
-        else
-            archivosLista = resolved.Select(r => r.DisplayName).ToList();
-
-        var summary = new JournalHistoricoDownloadSummaryDto
-        {
-            NombreZip = zipFileName,
-            Ep = multiEpLayout ? epsLabel : distinctEps[0],
-            ArchivosIncluidos = archivosLista,
-            Modo = modo,
-            Partes = partes
-        };
-
-        return (zipFileName, summary);
+        return multiEpLayout ? CountZipEntries(zipPath) : CountUnifiedTxtParts(zipPath);
     }
+
+    private static List<string> ListarArchivos(List<ResolvedJournalFile> resolved, bool multiEpLayout) =>
+        multiEpLayout
+            ? resolved.Select(r => $"{r.Ep}/{r.DisplayName}").ToList()
+            : resolved.Select(r => r.DisplayName).ToList();
 
     private sealed record ResolvedJournalFile(string Ep, string FullPath, string DisplayName);
 
@@ -571,109 +592,147 @@ public sealed class JournalHistoricoService(
         ep = string.Empty;
         fullPath = string.Empty;
         displayName = string.Empty;
+
         if (string.IsNullOrWhiteSpace(id))
             return false;
 
         if (id.StartsWith("n:", StringComparison.Ordinal))
-        {
-            var payload = FromBase64Url(id[2..]);
-            if (payload is null)
-                return false;
-            var parts = payload.Split('|', 3);
-            if (parts.Length != 3)
-                return false;
-            try
-            {
-                ep = NormalizeAndValidateEp(parts[0]);
-            }
-            catch (ArgumentException)
-            {
-                return false;
-            }
-
-            var lote = parts[1].Trim();
-            var rel = parts[2].Replace('/', Path.DirectorySeparatorChar).Trim();
-
-            if (string.IsNullOrWhiteSpace(lote) ||
-                lote is "." or ".." ||
-                lote.Contains("..", StringComparison.Ordinal) ||
-                lote.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 ||
-                Path.IsPathRooted(lote))
-            {
-                return false;
-            }
-
-            if (string.IsNullOrWhiteSpace(rel) || Path.IsPathRooted(rel))
-                return false;
-
-            if (!IsSafeRelativePath(rel))
-                return false;
-
-            if (allowedEps is not null && !allowedEps.Contains(ep))
-                return false;
-
-            var epDirectory = FindChildDirectory(rootFull, ep);
-            if (epDirectory is null)
-                return false;
-
-            var loteDirectory = FindChildDirectory(epDirectory, lote);
-            if (loteDirectory is null)
-                return false;
-
-            var normalizedRelative = rel
-                .Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
-
-            var matchedFile = Directory.EnumerateFiles(loteDirectory, "*", SearchOption.AllDirectories)
-                .FirstOrDefault(path => string.Equals(
-                    Path.GetRelativePath(loteDirectory, path),
-                    normalizedRelative,
-                    StringComparison.OrdinalIgnoreCase));
-
-            if (matchedFile is null)
-                return false;
-
-            fullPath = matchedFile;
-            displayName = normalizedRelative.Replace(Path.DirectorySeparatorChar, '/');
-            return true;
-        }
+            return TryResolveNuevoLayout(rootFull, id[2..], allowedEps, ref ep, out fullPath, out displayName);
 
         if (id.StartsWith("l:", StringComparison.Ordinal))
-        {
-            var name = FromBase64Url(id[2..]);
-            if (string.IsNullOrEmpty(name) || name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
-                return false;
-
-            if (!string.Equals(Path.GetFileName(name), name, StringComparison.Ordinal) ||
-                Path.IsPathRooted(name) ||
-                name.Contains("..", StringComparison.Ordinal))
-            {
-                return false;
-            }
-
-            var epPrefix = ExtractEpLegacyPrefix(name);
-            if (epPrefix is null)
-                return false;
-            ep = epPrefix;
-            if (allowedEps is not null && !allowedEps.Contains(epPrefix))
-                return false;
-            if (!name.StartsWith(epPrefix + "_", StringComparison.OrdinalIgnoreCase))
-                return false;
-            var matchedFile = Directory.EnumerateFiles(rootFull)
-                .FirstOrDefault(path => string.Equals(
-                    Path.GetFileName(path),
-                    name,
-                    StringComparison.OrdinalIgnoreCase));
-
-            if (matchedFile is null)
-                return false;
-
-            fullPath = matchedFile;
-            displayName = name;
-            return true;
-        }
+            return TryResolveLegacy(rootFull, id[2..], allowedEps, ref ep, out fullPath, out displayName);
 
         return false;
     }
+
+    /// <summary>
+    /// Identificador del layout nuevo: base64url de "ep|lote|rutaRelativa".
+    /// Cada validacion evita salir del directorio raiz; no eliminar ninguna.
+    /// </summary>
+    private static bool TryResolveNuevoLayout(
+        string rootFull,
+        string payloadCodificado,
+        HashSet<string>? allowedEps,
+        ref string ep,
+        out string fullPath,
+        out string displayName)
+    {
+        fullPath = string.Empty;
+        displayName = string.Empty;
+
+        var payload = FromBase64Url(payloadCodificado);
+        if (payload is null)
+            return false;
+
+        var parts = payload.Split('|', 3);
+        if (parts.Length != 3)
+            return false;
+
+        try
+        {
+            ep = NormalizeAndValidateEp(parts[0]);
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+
+        var lote = parts[1].Trim();
+        var rel = parts[2].Replace('/', Path.DirectorySeparatorChar).Trim();
+
+        if (!EsSegmentoLoteValido(lote))
+            return false;
+
+        if (string.IsNullOrWhiteSpace(rel) || Path.IsPathRooted(rel) || !IsSafeRelativePath(rel))
+            return false;
+
+        if (allowedEps is not null && !allowedEps.Contains(ep))
+            return false;
+
+        var epDirectory = FindChildDirectory(rootFull, ep);
+        if (epDirectory is null)
+            return false;
+
+        var loteDirectory = FindChildDirectory(epDirectory, lote);
+        if (loteDirectory is null)
+            return false;
+
+        var normalizedRelative = rel
+            .Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
+
+        var matchedFile = Directory.EnumerateFiles(loteDirectory, "*", SearchOption.AllDirectories)
+            .FirstOrDefault(path => string.Equals(
+                Path.GetRelativePath(loteDirectory, path),
+                normalizedRelative,
+                StringComparison.OrdinalIgnoreCase));
+
+        if (matchedFile is null)
+            return false;
+
+        fullPath = matchedFile;
+        displayName = normalizedRelative.Replace(Path.DirectorySeparatorChar, '/');
+        return true;
+    }
+
+    /// <summary>
+    /// Identificador legacy: base64url del nombre de archivo en la raiz, con prefijo de EP.
+    /// Cada validacion evita salir del directorio raiz; no eliminar ninguna.
+    /// </summary>
+    private static bool TryResolveLegacy(
+        string rootFull,
+        string nombreCodificado,
+        HashSet<string>? allowedEps,
+        ref string ep,
+        out string fullPath,
+        out string displayName)
+    {
+        fullPath = string.Empty;
+        displayName = string.Empty;
+
+        var name = FromBase64Url(nombreCodificado);
+        if (string.IsNullOrEmpty(name) || !EsNombreArchivoPlano(name))
+            return false;
+
+        var epPrefix = ExtractEpLegacyPrefix(name);
+        if (epPrefix is null)
+            return false;
+
+        ep = epPrefix;
+
+        if (allowedEps is not null && !allowedEps.Contains(epPrefix))
+            return false;
+
+        if (!name.StartsWith(epPrefix + "_", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var matchedFile = Directory.EnumerateFiles(rootFull)
+            .FirstOrDefault(path => string.Equals(
+                Path.GetFileName(path),
+                name,
+                StringComparison.OrdinalIgnoreCase));
+
+        if (matchedFile is null)
+            return false;
+
+        fullPath = matchedFile;
+        displayName = name;
+        return true;
+    }
+
+    /// <summary>El lote debe ser un nombre de carpeta simple, sin rutas ni referencias al padre.</summary>
+    private static bool EsSegmentoLoteValido(string lote) =>
+        !string.IsNullOrWhiteSpace(lote) &&
+        lote is not ("." or "..") &&
+        !lote.Contains("..", StringComparison.Ordinal) &&
+        lote.IndexOfAny(Path.GetInvalidFileNameChars()) < 0 &&
+        !Path.IsPathRooted(lote);
+
+    /// <summary>El nombre debe ser un archivo suelto, sin componentes de ruta.</summary>
+    private static bool EsNombreArchivoPlano(string name) =>
+        name.IndexOfAny(Path.GetInvalidFileNameChars()) < 0 &&
+        string.Equals(Path.GetFileName(name), name, StringComparison.Ordinal) &&
+        !Path.IsPathRooted(name) &&
+        !name.Contains("..", StringComparison.Ordinal);
 
     private static string? ExtractEpLegacyPrefix(string fileName)
     {
