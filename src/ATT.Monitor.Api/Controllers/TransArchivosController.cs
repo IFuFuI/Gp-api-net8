@@ -129,14 +129,9 @@ public sealed class TransArchivosController(
     [ProducesResponseType(StatusCodes.Status200OK)]
     public async Task<IActionResult> SubirZip([FromForm] ArchivoRequest request)
     {
-        var idSolicitud = 0;
-
-        if (request.archivo is null || request.archivo.Length == 0)
-            return BadRequest(MsgSinArchivo);
-        if (!string.Equals(Path.GetExtension(request.archivo.FileName), ZipExtension, StringComparison.OrdinalIgnoreCase))
-            return BadRequest(MsgSoloZip);
-        if (string.IsNullOrWhiteSpace(request.tipoarchivo))
-            return BadRequest(MsgTipoArchivoRequerido);
+        var error = ValidarArchivoZip(request, MsgTipoArchivoRequerido);
+        if (error is not null)
+            return BadRequest(error);
 
         try
         {
@@ -146,17 +141,10 @@ public sealed class TransArchivosController(
             Directory.CreateDirectory(carpetaDestino);
 
             var nombreOriginal = Path.GetFileNameWithoutExtension(request.archivo.FileName);
-            var partes = nombreOriginal.Split('_', 2);
-            if (partes.Length > 0 && int.TryParse(partes[0], out var idExtraido))
-                idSolicitud = idExtraido;
-
+            var idSolicitud = ExtraerIdSolicitud(nombreOriginal);
             var procesoEspecial = idSolicitud == 0;
 
-            var extension = Path.GetExtension(request.archivo.FileName);
-            var random = Path.GetRandomFileName().Replace(".", string.Empty, StringComparison.Ordinal);
-            if (random.Length < RandomLenSubirZip)
-                random = random.PadRight(RandomLenSubirZip, 'x');
-            var nombreFinal = $"{nombreOriginal}_{random[..RandomLenSubirZip]}{extension}";
+            var nombreFinal = ConstruirNombreFinal(nombreOriginal, Path.GetExtension(request.archivo.FileName));
             var rutaFinal = Path.Combine(carpetaDestino, nombreFinal);
 
             await using (var fs = new FileStream(rutaFinal, FileMode.Create, FileAccess.Write, FileShare.None))
@@ -167,54 +155,11 @@ public sealed class TransArchivosController(
             if (procesoEspecial)
                 await ExtraerJournalDiaDesdeZipAsync(request, nombreFinal).ConfigureAwait(false);
 
-            string[] archivosExtraidos = [];
-            var zipProtegido = false;
+            await RegistrarComandoAsync(request, idSolicitud, nombreFinal).ConfigureAwait(false);
 
-            if (request.APLICACION == 1)
-            {
-                var cmdResult = await transArchivo.InsertComandoAsync(request.idatm, 0, "DOWNLOAD", HttpContext.RequestAborted)
+            var (archivosExtraidos, zipProtegido) =
+                await ExtraerYRegistrarAsync(request, rutaFinal, carpetaExtract, carpetaDestino, nombreFinal)
                     .ConfigureAwait(false);
-                await transArchivo.InsertArchivoComandoAtmAsync(cmdResult.ResultInt, nombreFinal, HttpContext.RequestAborted)
-                    .ConfigureAwait(false);
-            }
-            else
-            {
-                await transArchivo.InsertArchivoComandoAtmAsync(idSolicitud, nombreFinal, HttpContext.RequestAborted)
-                    .ConfigureAwait(false);
-            }
-
-            try
-            {
-                ZipFile.ExtractToDirectory(rutaFinal, carpetaExtract);
-                archivosExtraidos = Directory.GetFiles(carpetaExtract, SearchPatternAll, SearchOption.AllDirectories);
-
-                await transArchivo.GuardarArchivosExtraidosAsync(
-                    archivosExtraidos,
-                    carpetaDestino,
-                    nombreFinal,
-                    1,
-                    request.idatm,
-                    request.APLICACION ?? 0,
-                    HttpContext.RequestAborted).ConfigureAwait(false);
-            }
-            catch (InvalidDataException ex) when (
-                ex.Message.Contains("unsupported compression method", StringComparison.OrdinalIgnoreCase) ||
-                ex.Message.Contains("encrypted", StringComparison.OrdinalIgnoreCase))
-            {
-                zipProtegido = true;
-            }
-            finally
-            {
-                try
-                {
-                    if (Directory.Exists(carpetaExtract))
-                        Directory.Delete(carpetaExtract, recursive: true);
-                }
-                catch
-                {
-                    // ignorar limpieza
-                }
-            }
 
             if (zipProtegido)
             {
@@ -246,6 +191,105 @@ public sealed class TransArchivosController(
         catch (Exception ex)
         {
             return StatusCode(StatusCodes.Status500InternalServerError, $"Error al procesar ZIP: {ex.Message}");
+        }
+    }
+
+    /// <summary>Valida presencia, extension y tipo del archivo. Devuelve el mensaje de error o null.</summary>
+    private static string? ValidarArchivoZip(ArchivoRequest request, string mensajeTipoRequerido)
+    {
+        if (request.archivo is null || request.archivo.Length == 0)
+            return MsgSinArchivo;
+
+        if (!string.Equals(Path.GetExtension(request.archivo.FileName), ZipExtension, StringComparison.OrdinalIgnoreCase))
+            return MsgSoloZip;
+
+        if (string.IsNullOrWhiteSpace(request.tipoarchivo))
+            return mensajeTipoRequerido;
+
+        return null;
+    }
+
+    /// <summary>El id de solicitud viene como prefijo numerico del nombre; 0 marca el proceso especial.</summary>
+    private static int ExtraerIdSolicitud(string nombreOriginal)
+    {
+        var partes = nombreOriginal.Split('_', 2);
+        return partes.Length > 0 && int.TryParse(partes[0], out var id) ? id : 0;
+    }
+
+    private static string ConstruirNombreFinal(string nombreOriginal, string extension)
+    {
+        var random = Path.GetRandomFileName().Replace(".", string.Empty, StringComparison.Ordinal);
+        if (random.Length < RandomLenSubirZip)
+            random = random.PadRight(RandomLenSubirZip, 'x');
+
+        return $"{nombreOriginal}_{random[..RandomLenSubirZip]}{extension}";
+    }
+
+    private async Task RegistrarComandoAsync(ArchivoRequest request, int idSolicitud, string nombreFinal)
+    {
+        if (request.APLICACION == 1)
+        {
+            var cmdResult = await transArchivo.InsertComandoAsync(request.idatm, 0, "DOWNLOAD", HttpContext.RequestAborted)
+                .ConfigureAwait(false);
+            await transArchivo.InsertArchivoComandoAtmAsync(cmdResult.ResultInt, nombreFinal, HttpContext.RequestAborted)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        await transArchivo.InsertArchivoComandoAtmAsync(idSolicitud, nombreFinal, HttpContext.RequestAborted)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>Extrae el ZIP y registra su contenido. Un ZIP protegido no es error: se informa al llamador.</summary>
+    private async Task<(string[] Archivos, bool Protegido)> ExtraerYRegistrarAsync(
+        ArchivoRequest request,
+        string rutaFinal,
+        string carpetaExtract,
+        string carpetaDestino,
+        string nombreFinal)
+    {
+        try
+        {
+            ZipFile.ExtractToDirectory(rutaFinal, carpetaExtract);
+            var archivos = Directory.GetFiles(carpetaExtract, SearchPatternAll, SearchOption.AllDirectories);
+
+            await transArchivo.GuardarArchivosExtraidosAsync(
+                archivos,
+                carpetaDestino,
+                nombreFinal,
+                1,
+                request.idatm,
+                request.APLICACION ?? 0,
+                HttpContext.RequestAborted).ConfigureAwait(false);
+
+            return (archivos, false);
+        }
+        catch (InvalidDataException ex) when (
+            ex.Message.Contains("unsupported compression method", StringComparison.OrdinalIgnoreCase) ||
+            ex.Message.Contains("encrypted", StringComparison.OrdinalIgnoreCase))
+        {
+            return ([], true);
+        }
+        finally
+        {
+            EliminarDirectorio(carpetaExtract);
+        }
+    }
+
+    private static void EliminarDirectorio(string ruta)
+    {
+        try
+        {
+            if (Directory.Exists(ruta))
+                Directory.Delete(ruta, recursive: true);
+        }
+        catch (IOException)
+        {
+            // limpieza best-effort: el archivo puede seguir bloqueado
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // limpieza best-effort: sin permisos sobre algun archivo
         }
     }
 
@@ -287,67 +331,64 @@ public sealed class TransArchivosController(
         if (string.IsNullOrWhiteSpace(journalRoot))
             return;
 
-        var epSeg = InvalidFileCharsRegex.Replace((request.idatm ?? string.Empty).Trim(), "_");
-        if (string.IsNullOrWhiteSpace(epSeg))
-            epSeg = "unknown";
-
-        var loteSeg = InvalidFileCharsRegex.Replace(Path.GetFileNameWithoutExtension(nombreZipEnArchivosAtm), "_");
-        if (string.IsNullOrWhiteSpace(loteSeg))
-            loteSeg = "lote";
-
+        var epSeg = SanitizarSegmento(request.idatm, "unknown");
+        var loteSeg = SanitizarSegmento(Path.GetFileNameWithoutExtension(nombreZipEnArchivosAtm), "lote");
         var destDir = Path.Combine(journalRoot, epSeg, loteSeg);
+
         try
         {
-            if (Directory.Exists(destDir))
-            {
-                Directory.Delete(destDir, recursive: true);
-            }
-
+            EliminarDirectorio(destDir);
             Directory.CreateDirectory(destDir);
+
             var destFull = Path.GetFullPath(destDir);
             if (!destFull.EndsWith(Path.DirectorySeparatorChar))
                 destFull += Path.DirectorySeparatorChar;
 
-            await using (var readStream = request.archivo.OpenReadStream())
-            using (var zip = new ZipArchive(readStream, ZipArchiveMode.Read, leaveOpen: false))
-            {
-                foreach (var entry in zip.Entries)
-                {
-                    if (string.IsNullOrEmpty(entry.Name))
-                        continue;
+            await using var readStream = request.archivo.OpenReadStream();
+            using var zip = new ZipArchive(readStream, ZipArchiveMode.Read, leaveOpen: false);
 
-                    var entryPath = entry.FullName.Replace('/', Path.DirectorySeparatorChar);
-                    var combined = Path.GetFullPath(Path.Combine(destFull.TrimEnd(Path.DirectorySeparatorChar), entryPath));
-                    if (!combined.StartsWith(destFull, StringComparison.OrdinalIgnoreCase))
-                        continue;
-
-                    if (Path.GetFileName(combined).Length == 0)
-                        continue;
-
-                    var parent = Path.GetDirectoryName(combined);
-                    if (!string.IsNullOrEmpty(parent))
-                        Directory.CreateDirectory(parent);
-
-                    if (entry.Length == 0 && string.IsNullOrEmpty(Path.GetExtension(combined)))
-                        continue;
-
-                    entry.ExtractToFile(combined, overwrite: true);
-                }
-            }
+            foreach (var entry in zip.Entries)
+                ExtraerEntrada(entry, destFull);
         }
-        catch
+        catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException)
         {
-            try
-            {
-                if (Directory.Exists(destDir))
-                    Directory.Delete(destDir, recursive: true);
-            }
-            catch
-            {
-                // ignorar rollback
-            }
+            // rollback: no dejar el lote a medias
+            EliminarDirectorio(destDir);
         }
+    }
 
-        await Task.CompletedTask.ConfigureAwait(false);
+    private static string SanitizarSegmento(string? valor, string porDefecto)
+    {
+        var limpio = InvalidFileCharsRegex.Replace((valor ?? string.Empty).Trim(), "_");
+        return string.IsNullOrWhiteSpace(limpio) ? porDefecto : limpio;
+    }
+
+    /// <summary>
+    /// Escribe una entrada del ZIP dentro de destFull. La comparacion con destFull es la mitigacion
+    /// de ZipSlip: descarta entradas cuya ruta resuelta cae fuera del directorio destino.
+    /// </summary>
+    private static void ExtraerEntrada(ZipArchiveEntry entry, string destFull)
+    {
+        if (string.IsNullOrEmpty(entry.Name))
+            return;
+
+        var entryPath = entry.FullName.Replace('/', Path.DirectorySeparatorChar);
+        var combined = Path.GetFullPath(Path.Combine(destFull.TrimEnd(Path.DirectorySeparatorChar), entryPath));
+
+        if (!combined.StartsWith(destFull, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        if (Path.GetFileName(combined).Length == 0)
+            return;
+
+        var parent = Path.GetDirectoryName(combined);
+        if (!string.IsNullOrEmpty(parent))
+            Directory.CreateDirectory(parent);
+
+        // entrada sin contenido ni extension: es un marcador de carpeta, no un archivo
+        if (entry.Length == 0 && string.IsNullOrEmpty(Path.GetExtension(combined)))
+            return;
+
+        entry.ExtractToFile(combined, overwrite: true);
     }
 }

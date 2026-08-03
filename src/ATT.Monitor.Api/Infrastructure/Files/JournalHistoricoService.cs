@@ -29,37 +29,11 @@ public sealed class JournalHistoricoService(
         var opt = options.CurrentValue;
         var eps = ResolveEpsForList(request);
 
-        var desde = request.Desde.Kind == DateTimeKind.Utc ? request.Desde : request.Desde.ToUniversalTime();
-        var hasta = request.Hasta.Kind == DateTimeKind.Utc ? request.Hasta : request.Hasta.ToUniversalTime();
-        if (hasta < desde)
-            (desde, hasta) = (hasta, desde);
-
         var maxDays = Math.Max(1, opt.MaxRangeDays);
-        if ((hasta - desde).TotalDays > maxDays)
-            hasta = desde.AddDays(maxDays);
+        var (desde, hasta) = NormalizarRango(request.Desde, request.Hasta, maxDays);
 
-        var journalRoot = filePaths.GetJournalDiaRoot();
-        var list = new List<JournalHistoricoItemDto>();
-        if (!string.IsNullOrWhiteSpace(journalRoot) && Directory.Exists(journalRoot))
-        {
-            var rootFull = Path.GetFullPath(journalRoot);
-            foreach (var ep in eps)
-            {
-                if (list.Count >= opt.MaxListScanFiles)
-                    break;
-                CollectNewLayout(rootFull, ep, desde, hasta, list, opt.MaxListScanFiles);
-                if (list.Count < opt.MaxListScanFiles)
-                    CollectLegacyRootFiles(rootFull, ep, desde, hasta, list, opt.MaxListScanFiles);
-            }
-        }
-
-        list.Sort((a, b) =>
-        {
-            var c = string.Compare(a.Ep, b.Ep, StringComparison.OrdinalIgnoreCase);
-            if (c != 0)
-                return c;
-            return b.ModificadoUtc.CompareTo(a.ModificadoUtc);
-        });
+        var list = RecolectarArchivos(eps, desde, hasta, opt.MaxListScanFiles);
+        list.Sort(CompararPorEpYFecha);
 
         var total = list.Count;
         var tam = Math.Clamp(request.TamPagina, 1, 200);
@@ -73,6 +47,58 @@ public sealed class JournalHistoricoService(
             Total = total,
             RangoMaximoDias = maxDays
         });
+    }
+
+    /// <summary>Lleva ambos extremos a UTC, los ordena y recorta el rango al maximo permitido.</summary>
+    private static (DateTime Desde, DateTime Hasta) NormalizarRango(DateTime desde, DateTime hasta, int maxDays)
+    {
+        if (desde.Kind != DateTimeKind.Utc)
+            desde = desde.ToUniversalTime();
+
+        if (hasta.Kind != DateTimeKind.Utc)
+            hasta = hasta.ToUniversalTime();
+
+        if (hasta < desde)
+            (desde, hasta) = (hasta, desde);
+
+        if ((hasta - desde).TotalDays > maxDays)
+            hasta = desde.AddDays(maxDays);
+
+        return (desde, hasta);
+    }
+
+    private List<JournalHistoricoItemDto> RecolectarArchivos(
+        List<string> eps,
+        DateTime desde,
+        DateTime hasta,
+        int maxItems)
+    {
+        var list = new List<JournalHistoricoItemDto>();
+
+        var journalRoot = filePaths.GetJournalDiaRoot();
+        if (string.IsNullOrWhiteSpace(journalRoot) || !Directory.Exists(journalRoot))
+            return list;
+
+        var rootFull = Path.GetFullPath(journalRoot);
+        foreach (var ep in eps)
+        {
+            if (list.Count >= maxItems)
+                break;
+
+            CollectNewLayout(rootFull, ep, desde, hasta, list, maxItems);
+
+            if (list.Count < maxItems)
+                CollectLegacyRootFiles(rootFull, ep, desde, hasta, list, maxItems);
+        }
+
+        return list;
+    }
+
+    /// <summary>Agrupa por EP y, dentro de cada uno, deja primero el archivo mas reciente.</summary>
+    private static int CompararPorEpYFecha(JournalHistoricoItemDto a, JournalHistoricoItemDto b)
+    {
+        var c = string.Compare(a.Ep, b.Ep, StringComparison.OrdinalIgnoreCase);
+        return c != 0 ? c : b.ModificadoUtc.CompareTo(a.ModificadoUtc);
     }
 
     private static List<string> ResolveEpsForList(JournalHistoricoListRequest request)
@@ -180,29 +206,47 @@ public sealed class JournalHistoricoService(
                 if (list.Count >= maxItems)
                     return;
 
-                var fileFullPath = Path.GetFullPath(file);
-                if (!fileFullPath.StartsWith(loteFullPath, StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                var fi = new FileInfo(fileFullPath);
-                var t = fi.LastWriteTimeUtc;
-                if (t < desdeUtc || t > hastaUtc)
-                    continue;
-
-                var rel = Path.GetRelativePath(loteDir, fileFullPath).Replace(Path.DirectorySeparatorChar, '/');
-                var id = "n:" + ToBase64Url($"{safeEp}|{loteId}|{rel}");
-                list.Add(new JournalHistoricoItemDto
-                {
-                    Id = id,
-                    Ep = safeEp,
-                    LoteId = loteId,
-                    NombreArchivo = fi.Name,
-                    RutaRelativa = string.IsNullOrEmpty(rel) ? fi.Name : rel,
-                    TamanoBytes = fi.Length,
-                    ModificadoUtc = t
-                });
+                var item = CrearItemNuevoLayout(file, loteDir, loteFullPath, safeEp, loteId, desdeUtc, hastaUtc);
+                if (item is not null)
+                    list.Add(item);
             }
         }
+    }
+
+    /// <summary>
+    /// Construye el item si el archivo esta dentro del lote y en el rango de fechas; null si no aplica.
+    /// La comparacion con loteFullPath evita seguir enlaces fuera del directorio.
+    /// </summary>
+    private static JournalHistoricoItemDto? CrearItemNuevoLayout(
+        string file,
+        string loteDir,
+        string loteFullPath,
+        string safeEp,
+        string loteId,
+        DateTime desdeUtc,
+        DateTime hastaUtc)
+    {
+        var fileFullPath = Path.GetFullPath(file);
+        if (!fileFullPath.StartsWith(loteFullPath, StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        var fi = new FileInfo(fileFullPath);
+        var t = fi.LastWriteTimeUtc;
+        if (t < desdeUtc || t > hastaUtc)
+            return null;
+
+        var rel = Path.GetRelativePath(loteDir, fileFullPath).Replace(Path.DirectorySeparatorChar, '/');
+
+        return new JournalHistoricoItemDto
+        {
+            Id = "n:" + ToBase64Url($"{safeEp}|{loteId}|{rel}"),
+            Ep = safeEp,
+            LoteId = loteId,
+            NombreArchivo = fi.Name,
+            RutaRelativa = string.IsNullOrEmpty(rel) ? fi.Name : rel,
+            TamanoBytes = fi.Length,
+            ModificadoUtc = t
+        };
     }
 
     private static void CollectLegacyRootFiles(
